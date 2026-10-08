@@ -1,0 +1,7 @@
+// Redefinitions for syntactic sugar
+
+<fn> ::= <ident> <params> :: <expr>
+
+<params> ::= <ident> | <ident> <params>
+
+<if> ::= <expr> ? <expr> : <expr>
