@@ -4,4 +4,4 @@
 
 <params> ::= <ident> | <ident> <params>
 
-<if> ::= <expr> ? <expr> : <expr>
+<if> ::= <expr> "?" <expr> ":" <expr>

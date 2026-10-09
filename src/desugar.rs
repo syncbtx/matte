@@ -1,113 +1,139 @@
 use bumpalo::Bump;
-use crate::ast::core::{Program, Item, Expression, ExprKind, Identifier};
-use crate::diagnostics::ParserError;
-use ariadne::{Report, ReportKind, Label};
+use logos::Span;
 
+use crate::ast::core::{ExprKind, Expression, Identifier, Item, Program};
+use crate::diagnostics::ParserError;
+
+/// Rewrites sugar nodes into core ones. Today that is one rewrite:
+///
+///   FnBinding { target: `max x y`, value: e }
+///     =>  Binding { name: max, value: fn x -> fn y -> e }
+///
+/// Input and output are the same AST type. The difference is the invariant:
+/// after `run`, no `Item::FnBinding` remains. Bad binding heads are collected,
+/// so one run reports every one of them.
 pub struct Desugarer<'a> {
-    pub arena: &'a Bump,
+    arena: &'a Bump,
+    errors: Vec<ParserError<'a>>,
 }
 
 impl<'a> Desugarer<'a> {
     pub fn new(arena: &'a Bump) -> Self {
-        Self { arena }
-    }
-
-    pub fn desugar(&self, prog: &Program<'a>) -> Result<Program<'a>, ParserError<'a>> {
-        let mut items = Vec::new();
-        for item in &prog.items {
-            items.push(self.desugar_item(item)?);
+        Self {
+            arena,
+            errors: Vec::new(),
         }
-        Ok(Program { items })
     }
 
-    fn desugar_item(&self, item: &Item<'a>) -> Result<Item<'a>, ParserError<'a>> {
-        match item {
-            Item::Expr(expr) => Ok(Item::Expr(self.desugar_expr(expr)?)),
-            Item::Print { type_of, expr } => Ok(Item::Print {
-                type_of: *type_of,
-                expr: self.desugar_expr(expr)?,
-            }),
-            Item::Binding { name, value } => Ok(Item::Binding {
-                name,
-                value: self.desugar_expr(value)?,
-            }),
-            Item::FnDefinition { name, params, body } => Ok(Item::FnDefinition {
-                name,
-                params,
-                body: self.desugar_expr(body)?,
-            }),
-            Item::SugarBinding { target, value } => {
-                let desugared_value = self.desugar_expr(value)?;
-                
-                let mut current = *target;
-                let mut params = Vec::new();
-                
-                while let ExprKind::App { func, arg } = &current.kind {
-                    if let ExprKind::Ident(name) = arg.kind {
-                        params.push(Identifier { name, span: arg.span.clone() });
-                    } else {
-                        return Err(ParserError(Report::build(ReportKind::Error, arg.span.clone())
-                            .with_message("function parameter must be an identifier")
-                            .with_label(Label::new(arg.span.clone()).with_message("not an identifier"))
-                            .finish()));
-                    }
-                    current = func;
-                }
-                
-                if let ExprKind::Ident(name) = current.kind {
-                    if params.is_empty() {
-                        Ok(Item::Binding {
-                            name,
-                            value: desugared_value,
-                        })
-                    } else {
-                        params.reverse();
-                        let params_slice = self.arena.alloc_slice_fill_iter(params.into_iter());
-                        Ok(Item::FnDefinition {
-                            name,
-                            params: params_slice,
-                            body: desugared_value,
-                        })
-                    }
-                } else {
-                    Err(ParserError(Report::build(ReportKind::Error, target.span.clone())
-                        .with_message("invalid binding target")
-                        .with_label(Label::new(target.span.clone()).with_message("expected identifier or function application"))
-                        .finish()))
-                }
+    pub fn run(
+        mut self,
+        program: Program<'a>,
+    ) -> std::result::Result<Program<'a>, Vec<ParserError<'a>>> {
+        let mut items = Vec::with_capacity(program.items.len());
+        for item in program.items {
+            if let Some(item) = self.item(item) {
+                items.push(item);
             }
         }
+        if self.errors.is_empty() {
+            Ok(Program { items })
+        } else {
+            Err(self.errors)
+        }
     }
 
-    fn desugar_expr(&self, expr: &Expression<'a>) -> Result<&'a Expression<'a>, ParserError<'a>> {
-        let kind = match &expr.kind {
-            ExprKind::Unit => ExprKind::Unit,
-            ExprKind::Ident(name) => ExprKind::Ident(name),
-            ExprKind::Num(n) => ExprKind::Num(*n),
-            ExprKind::Bool(b) => ExprKind::Bool(*b),
-            ExprKind::Unary { op, expr: inner } => ExprKind::Unary {
-                op: op.clone(),
-                expr: self.desugar_expr(inner)?,
-            },
-            ExprKind::BinaryOp { left, op, right } => ExprKind::BinaryOp {
-                left: self.desugar_expr(left)?,
-                op: op.clone(),
-                right: self.desugar_expr(right)?,
-            },
-            ExprKind::If { cond, then_branch, else_branch } => ExprKind::If {
-                cond: self.desugar_expr(cond)?,
-                then_branch: self.desugar_expr(then_branch)?,
-                else_branch: self.desugar_expr(else_branch)?,
-            },
-            ExprKind::Fn { arg, body } => ExprKind::Fn {
-                arg: Identifier { name: arg.name, span: arg.span.clone() },
-                body: self.desugar_expr(body)?,
-            },
-            ExprKind::App { func, arg } => ExprKind::App {
-                func: self.desugar_expr(func)?,
-                arg: self.desugar_expr(arg)?,
-            },
+    fn item(&mut self, item: Item<'a>) -> Option<Item<'a>> {
+        match item {
+            Item::FnBinding { target, value } => self.fn_binding(target, value),
+            // Expr, Print and Binding already hold core expressions.
+            other => Some(other),
+        }
+    }
+
+    fn fn_binding(
+        &mut self,
+        target: &'a Expression<'a>,
+        value: &'a Expression<'a>,
+    ) -> Option<Item<'a>> {
+        let (name, params) = self.split_head(target)?;
+
+        // Wrap innermost-first, so `max x y :: e` becomes fn x -> fn y -> e.
+        // The outermost Fn spans from the start of the whole head.
+        let mut body = value;
+        for (i, arg) in params.into_iter().enumerate().rev() {
+            let start = if i == 0 {
+                target.span.start
+            } else {
+                arg.span.start
+            };
+            let span = Span {
+                start,
+                end: body.span.end,
+            };
+            body = self.arena.alloc(Expression {
+                kind: ExprKind::Fn { arg, body },
+                span,
+            });
+        }
+
+        Some(Item::Binding { name, value: body })
+    }
+
+    /// Splits `f a b` (= App(App(f, a), b)) into `f` and `[a, b]`, requiring
+    /// every part to be a plain identifier. Keeps walking after a bad
+    /// argument so all bad parts are reported.
+    fn split_head(
+        &mut self,
+        target: &'a Expression<'a>,
+    ) -> Option<(Identifier<'a>, Vec<Identifier<'a>>)> {
+        let mut cur = target;
+        let mut params = Vec::new();
+        let mut ok = true;
+
+        while let ExprKind::App { func, arg } = &cur.kind {
+            match arg.kind {
+                ExprKind::Ident(name) => params.push(Identifier {
+                    name,
+                    span: arg.span.clone(),
+                }),
+                _ => {
+                    self.error(
+                        arg.span.clone(),
+                        "function parameter must be an identifier",
+                        "not an identifier",
+                    );
+                    ok = false;
+                }
+            }
+            cur = *func;
+        }
+
+        let head = match cur.kind {
+            ExprKind::Ident(name) => Some(Identifier {
+                name,
+                span: cur.span.clone(),
+            }),
+            _ => {
+                self.error(
+                    cur.span.clone(),
+                    "function name must be an identifier",
+                    "not an identifier",
+                );
+                None
+            }
         };
-        Ok(self.arena.alloc(Expression { kind, span: expr.span.clone() }))
+
+        // The spine is walked outside-in, so parameters were collected last-first.
+        params.reverse();
+        if ok { head.map(|h| (h, params)) } else { None }
+    }
+
+    fn error(&mut self, span: Span, message: &str, label: &str) {
+        self.errors.push(ParserError(
+            ariadne::Report::build(ariadne::ReportKind::Error, span.clone())
+                .with_message(message)
+                .with_label(ariadne::Label::new(span).with_message(label))
+                .finish(),
+        ));
     }
 }

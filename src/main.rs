@@ -1,10 +1,11 @@
 use ariadne::Source;
 use bumpalo::Bump;
 
-use matte::lexer::tokenize;
-use matte::parser::MatteParser;
+use matte::checker::{Type, TypeChecker};
 use matte::desugar::Desugarer;
 use matte::diagnostics::ParserError;
+use matte::lexer::tokenize;
+use matte::parser::MatteParser;
 
 fn line_col(src: &str, offset: usize) -> (usize, usize) {
     let before = &src[..offset];
@@ -12,6 +13,14 @@ fn line_col(src: &str, offset: usize) -> (usize, usize) {
     let line_start = before.rfind('\n').map_or(0, |i| i + 1);
     let col = before[line_start..].chars().count() + 1;
     (line, col)
+}
+
+fn has_var(t: &Type) -> bool {
+    match t {
+        Type::Var(_) => true,
+        Type::Fn(a, b) => has_var(a) || has_var(b),
+        _ => false,
+    }
 }
 
 fn main() {
@@ -29,17 +38,30 @@ fn main() {
             let mut parser = MatteParser::new(tokens.into_iter(), &arena);
 
             match parser.parse() {
-                Ok(raw_ast) => {
-                    let desugarer = Desugarer::new(&arena);
-                    match desugarer.desugar(&raw_ast) {
-                        Ok(core_ast) => {
-                            println!("{:#?}", core_ast);
+                Ok(raw_ast) => match Desugarer::new(&arena).run(raw_ast) {
+                    Ok(ast) => {
+                        println!("{}", src);
+                        match TypeChecker::new(&arena).check(&ast) {
+                            Ok(checked) => {
+                                /* checked.bindings, checked.typeofs */
+                                debug_assert!(checked.node_types.values().all(|t| !has_var(t)));
+
+                                println!("{:#?}", ast);
+                                checked.print();
+                            }
+                            Err(errors) => {
+                                for ParserError(report) in errors {
+                                    report.print(Source::from(src.as_str())).unwrap();
+                                }
+                            }
                         }
-                        Err(ParserError(report)) => {
+                    }
+                    Err(errors) => {
+                        for ParserError(report) in errors {
                             report.print(Source::from(src.as_str())).unwrap();
                         }
                     }
-                }
+                },
                 Err(ParserError(report)) => {
                     report.print(Source::from(src.as_str())).unwrap();
                 }

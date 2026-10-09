@@ -32,7 +32,8 @@
 
 <app> ::= <atom> | <app> <atom>
 
-<atom> ::= "true"
+<atom> ::= "()"
+         | "true"
          | "false"
          | <num>
          | <ident>

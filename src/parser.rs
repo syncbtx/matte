@@ -29,36 +29,53 @@ impl<'a, I: Iterator<Item = Token<'a>>> MatteParser<'a, I> {
         Ok(Program { items })
     }
 
+    /// An item is one of:
+    ///   print [typeof] expr;
+    ///   expr;                       -> Item::Expr
+    ///   name :: expr;               -> Item::Binding      (pure)
+    ///   <application> :: expr;      -> Item::FnBinding    (sugar, validated by desugar)
+    ///
+    /// Everything that is not `print` starts as an ordinary expression. Only
+    /// after seeing `::` do we know it was a binding head. A bare identifier
+    /// head is a plain Binding; any other head (e.g. `max x y`) is kept as an
+    /// unvalidated application target for the desugar pass.
     pub fn parse_item(&mut self) -> std::result::Result<Item<'a>, ParserError<'a>> {
-        if let Some(tok) = self.stream.peek() {
-            if matches!(tok.kind, TokenKind::Print) {
-                let _ = self.stream.next();
-                let type_of = if let Some(t) = self.stream.peek() {
-                    if matches!(t.kind, TokenKind::TypeOf) {
-                        let _ = self.stream.next();
-                        true
-                    } else { false }
-                } else { false };
-                let expr = self.arena.alloc(self.pratt_parse()?);
-                self.expect_semicolon()?;
-                return Ok(Item::Print { type_of, expr });
+        if matches!(self.stream.peek().map(|t| t.kind), Some(TokenKind::Print)) {
+            self.stream.next();
+            let type_of = matches!(self.stream.peek().map(|t| t.kind), Some(TokenKind::TypeOf));
+            if type_of {
+                self.stream.next();
             }
+            let expr = self.arena.alloc(self.pratt_parse()?);
+            self.expect_semicolon()?;
+            return Ok(Item::Print { type_of, expr });
         }
-        
+
         let lhs = self.arena.alloc(self.pratt_parse()?);
-        
-        if let Some(tok) = self.stream.peek() {
-            if matches!(tok.kind, TokenKind::DoubleColon) {
-                let _ = self.stream.next();
-                let rhs = self.arena.alloc(self.pratt_parse()?);
-                self.expect_semicolon()?;
-                return Ok(Item::SugarBinding { target: lhs, value: rhs });
-            }
+
+        if matches!(
+            self.stream.peek().map(|t| t.kind),
+            Some(TokenKind::DoubleColon)
+        ) {
+            self.stream.next();
+            let value = self.arena.alloc(self.pratt_parse()?);
+            self.expect_semicolon()?;
+            return Ok(match lhs.kind {
+                ExprKind::Ident(name) => Item::Binding {
+                    name: Identifier {
+                        name,
+                        span: lhs.span.clone(),
+                    },
+                    value,
+                },
+                _ => Item::FnBinding { target: lhs, value },
+            });
         }
-        
+
         self.expect_semicolon()?;
         Ok(Item::Expr(lhs))
     }
+
     fn expect_semicolon(&mut self) -> std::result::Result<(), ParserError<'a>> {
         match self.stream.next() {
             Some(tok) if matches!(tok.kind, TokenKind::SemiColon) => Ok(()),
@@ -67,47 +84,6 @@ impl<'a, I: Iterator<Item = Token<'a>>> MatteParser<'a, I> {
                 Err(err.into())
             }
             None => Err(vpratt::VprattError::UnexpectedEOF.into()),
-        }
-    }
-
-    fn extract_fn_def(
-        &self,
-        expr: &Expression<'a>,
-    ) -> std::result::Result<(&'a str, Vec<Identifier<'a>>), ParserError<'a>> {
-        let mut current = expr;
-        let mut params = Vec::new();
-
-        while let ExprKind::App { func, arg } = &current.kind {
-            if let ExprKind::Ident(name) = arg.kind {
-                params.push(Identifier {
-                    name,
-                    span: arg.span.clone(),
-                });
-            } else {
-                return Err(ParserError(
-                    ariadne::Report::build(ariadne::ReportKind::Error, arg.span.clone())
-                        .with_message("function parameter must be an identifier")
-                        .with_label(
-                            ariadne::Label::new(arg.span.clone()).with_message("not an identifier"),
-                        )
-                        .finish(),
-                ));
-            }
-            current = func;
-        }
-
-        if let ExprKind::Ident(name) = current.kind {
-            params.reverse();
-            Ok((name, params))
-        } else {
-            Err(ParserError(
-                ariadne::Report::build(ariadne::ReportKind::Error, current.span.clone())
-                    .with_message("function name must be an identifier")
-                    .with_label(
-                        ariadne::Label::new(current.span.clone()).with_message("not an identifier"),
-                    )
-                    .finish(),
-            ))
         }
     }
 }
@@ -121,6 +97,8 @@ impl<'a, I: Iterator<Item = Token<'a>>> MatteParser<'a, I> {
     extract = |token: &Token<'a>| token.kind.clone()
 )]
 impl<'a, I: Iterator<Item = Token<'a>>> MatteParser<'a, I> {
+    // Binding power, low to high:
+    //   @@ < ?: < comparison < + - < * / % < prefix - < ^ < application < postfix !
     const TABLE: vpratt::Table<Self> = vpratt::Table::new()
         .terminal(Ident(""), Self::terminals)
         .terminal(Num(0.0), Self::terminals)
@@ -130,7 +108,7 @@ impl<'a, I: Iterator<Item = Token<'a>>> MatteParser<'a, I> {
         .group(LParen, RParen, Self::grouped)
         .structural(If, Self::parse_if)
         .structural(Fn, Self::parse_fn)
-        .prefix(80, Minus, Self::neg)
+        .prefix(55, Minus, Self::neg)
         .postfix(90, Bang, Self::fact)
         .implied(70, vpratt::Associativity::Left, Ident(""), Self::app)
         .implied(70, vpratt::Associativity::Left, Num(0.0), Self::app)
@@ -208,26 +186,49 @@ impl<'a, I: Iterator<Item = Token<'a>>> MatteParser<'a, I> {
         })
     }
 
+    /// `fn x y z -> body` is nested right here into
+    /// `Fn(x, Fn(y, Fn(z, body)))`, so the AST only ever holds
+    /// single-parameter functions and no sugar node is needed.
     #[vpratt::handler]
     fn parse_fn(&mut self, ctx: StructuralCtx<Self>) -> vpratt::Result<Self> {
         let start = ctx.consumed.token.span.start;
-        let arg_tok = ctx.expect(self, Ident(""))?;
-        let Ident(name) = arg_tok.token.kind else {
+
+        let first = ctx.expect(self, Ident(""))?;
+        let Ident(name) = first.token.kind else {
             unreachable!()
         };
-        let arg = Identifier {
+        let mut params = vec![Identifier {
             name,
-            span: arg_tok.token.span,
-        };
+            span: first.token.span,
+        }];
+        while let Some(next) = ctx.accept(self, Ident(""))? {
+            let Ident(name) = next.token.kind else {
+                unreachable!()
+            };
+            params.push(Identifier {
+                name,
+                span: next.token.span,
+            });
+        }
+
         ctx.expect(self, Arrow)?;
-        let body = self.arena.alloc(ctx.sub.parse(self)?);
-        Ok(Expression {
-            kind: ExprKind::Fn { arg, body },
-            span: Span {
-                start,
-                end: body.span.end,
-            },
-        })
+        let mut acc = ctx.sub.parse(self)?;
+
+        // Wrap innermost-first. The outermost Fn spans from the `fn` keyword,
+        // inner ones from their own parameter.
+        for (i, arg) in params.into_iter().enumerate().rev() {
+            let span_start = if i == 0 { start } else { arg.span.start };
+            let end = acc.span.end;
+            let body = self.arena.alloc(acc);
+            acc = Expression {
+                kind: ExprKind::Fn { arg, body },
+                span: Span {
+                    start: span_start,
+                    end,
+                },
+            };
+        }
+        Ok(acc)
     }
 
     #[vpratt::handler]
@@ -243,6 +244,7 @@ impl<'a, I: Iterator<Item = Token<'a>>> MatteParser<'a, I> {
             },
         })
     }
+
     #[vpratt::handler]
     fn fact(&mut self, ctx: PostfixCtx<Self>) -> vpratt::Result<Self> {
         let end = ctx.consumed.token.span.end;
@@ -261,6 +263,7 @@ impl<'a, I: Iterator<Item = Token<'a>>> MatteParser<'a, I> {
     fn binary(&mut self, ctx: InfixCtx<Self>) -> vpratt::Result<Self> {
         let left = self.arena.alloc(ctx.lhs);
         let op_span = ctx.consumed.token.span.clone();
+        let is_cmp = matches!(ctx.consumed.token.kind, Eq | Ne | Lt | Gt | Le | Ge);
         let op = match ctx.consumed.token.kind {
             Plus => BinaryOp::Add(op_span),
             Minus => BinaryOp::Sub(op_span),
@@ -277,6 +280,20 @@ impl<'a, I: Iterator<Item = Token<'a>>> MatteParser<'a, I> {
             _ => unreachable!(),
         };
         let right = self.arena.alloc(ctx.rhs.parse(self)?);
+
+        // Comparisons are non-associative: `a < b < c` is a syntax error.
+        if is_cmp {
+            if let Some(next) = self.stream.peek() {
+                if matches!(next.kind, Eq | Ne | Lt | Gt | Le | Ge) {
+                    return Err(err(
+                        next.span.clone(),
+                        "comparison operators cannot be chained",
+                        "parenthesise one of the comparisons",
+                    ));
+                }
+            }
+        }
+
         Ok(Expression {
             kind: ExprKind::BinaryOp { left, op, right },
             span: Span {
@@ -311,6 +328,7 @@ impl<'a, I: Iterator<Item = Token<'a>>> MatteParser<'a, I> {
             },
         })
     }
+
     #[vpratt::handler]
     fn app(&mut self, ctx: ImpliedCtx<Self>) -> vpratt::Result<Self> {
         let start = ctx.lhs.span.start;
@@ -328,6 +346,7 @@ impl<'a, I: Iterator<Item = Token<'a>>> MatteParser<'a, I> {
             },
         })
     }
+
     #[vpratt::handler]
     fn app_op(&mut self, ctx: InfixCtx<Self>) -> vpratt::Result<Self> {
         let start = ctx.lhs.span.start;
@@ -341,4 +360,13 @@ impl<'a, I: Iterator<Item = Token<'a>>> MatteParser<'a, I> {
             },
         })
     }
+}
+
+fn err<'a>(span: Span, message: &str, label: &str) -> ParserError<'a> {
+    ParserError(
+        ariadne::Report::build(ariadne::ReportKind::Error, span.clone())
+            .with_message(message)
+            .with_label(ariadne::Label::new(span).with_message(label))
+            .finish(),
+    )
 }
