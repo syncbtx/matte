@@ -3,8 +3,11 @@ use std::collections::HashMap;
 use bumpalo::Bump;
 use logos::Span;
 
-use crate::ast::core::{BinaryOp, ExprKind, Expression, Item, Program};
+use crate::ast::core::{BinaryOp, UnaryOp};
 use crate::diagnostics::ParserError;
+use crate::resolve::{
+    ExprId, GlobalId, LocalId, ResolvedExprKind, ResolvedItem, ResolvedName, ResolvedProgram,
+};
 
 // ---------- types ----------
 
@@ -66,49 +69,58 @@ fn var_name(i: usize) -> String {
 
 // ---------- result ----------
 
+#[derive(Debug, Clone)]
+pub struct CheckedBinding<'a> {
+    pub id: GlobalId,
+    pub name: &'a str,
+    pub ty: Type<'a>,
+}
+
 #[derive(Debug)]
 pub struct Checked<'a> {
-    pub bindings: Vec<(&'a str, Type<'a>)>,
+    pub bindings: Vec<CheckedBinding<'a>>,
+    /// `(source item index, rendered type)` for `print typeof e;`.
     pub typeofs: Vec<(usize, String)>,
-    pub node_types: HashMap<usize, Type<'a>>,
+    /// Types are keyed by stable expression IDs, not raw AST addresses.
+    pub node_types: HashMap<ExprId, Type<'a>>,
 }
 
 impl<'a> Checked<'a> {
     pub fn print(&self) {
-        self.bindings
-            .iter()
-            .for_each(|(name, ty)| println!("{name} :: {}", ty.pretty()));
-        self.typeofs
-            .iter()
-            .for_each(|(_, s)| println!("typeof: {s}"));
+        for binding in &self.bindings {
+            println!("{} :: {}", binding.name, binding.ty.pretty());
+        }
+        for (_, ty) in &self.typeofs {
+            println!("typeof: {ty}");
+        }
+    }
+
+    pub fn type_of(&self, expr: ExprId) -> Option<&Type<'a>> {
+        self.node_types.get(&expr)
     }
 }
 
+#[derive(Debug)]
 enum UnifyError {
     Mismatch,
     Infinite,
 }
 
-struct Global<'a> {
-    ty: Type<'a>,
-    /// Set once the binding's value has been inferred. Until then only
-    /// function bodies may refer to it.
-    defined: bool,
-}
-
+/// Infers monomorphic types for a name-resolved, desugared program.
+///
+/// This checker intentionally does not implement Hindley–Milner let-polymorphism.
+/// An unresolved type variable is reported as ambiguous rather than silently
+/// defaulted to `Num`.
 pub struct TypeChecker<'a> {
     arena: &'a Bump,
     subst: Vec<Option<Type<'a>>>,
-    globals: HashMap<&'a str, Global<'a>>,
-    /// Function parameters in scope, innermost last.
-    locals: Vec<(&'a str, Type<'a>)>,
-    fn_depth: usize,
-    /// `==` / `<>` operand types, checked once types are resolved.
+    var_spans: Vec<Span>,
+    globals: Vec<Type<'a>>,
+    locals: Vec<Option<Type<'a>>>,
     eq_checks: Vec<(Type<'a>, Span)>,
-    /// `print e;` argument types, checked once types are resolved.
     print_checks: Vec<(Type<'a>, Span)>,
     typeof_types: Vec<(usize, Type<'a>)>,
-    node_types: HashMap<usize, Type<'a>>,
+    node_types: HashMap<ExprId, Type<'a>>,
     errors: Vec<ParserError<'a>>,
 }
 
@@ -117,9 +129,9 @@ impl<'a> TypeChecker<'a> {
         Self {
             arena,
             subst: Vec::new(),
-            globals: HashMap::new(),
+            var_spans: Vec::new(),
+            globals: Vec::new(),
             locals: Vec::new(),
-            fn_depth: 0,
             eq_checks: Vec::new(),
             print_checks: Vec::new(),
             typeof_types: Vec::new(),
@@ -128,61 +140,50 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
-    /// Expects a desugared program (no `Item::FnBinding`).
     pub fn check(
         mut self,
-        program: &Program<'a>,
-    ) -> std::result::Result<Checked<'a>, Vec<ParserError<'a>>> {
-        // Pass 1: declare every top-level name with a fresh type variable, so
-        // function bodies can refer to names defined later (recursion).
-        let mut skip = vec![false; program.items.len()];
-        for (idx, item) in program.items.iter().enumerate() {
-            if let Item::Binding { name, .. } = item {
-                if self.globals.contains_key(name.name) {
-                    self.error(
-                        &name.span,
-                        format!("`{}` is already defined", name.name),
-                        "redefinition",
-                    );
-                    skip[idx] = true;
-                } else {
-                    let ty = self.fresh();
-                    self.globals
-                        .insert(name.name, Global { ty, defined: false });
-                }
-            }
+        program: &ResolvedProgram<'a>,
+    ) -> Result<Checked<'a>, Vec<ParserError<'a>>> {
+        // Allocate a type variable for every declared global before inferring
+        // any body. This supports recursion and references between functions.
+        for global in program.globals {
+            let ty = self.fresh(&global.name_span);
+            self.globals.push(ty);
         }
+        self.locals = vec![None; program.local_count];
 
-        // Pass 2: infer items top to bottom.
         let mut bindings = Vec::new();
-        for (idx, item) in program.items.iter().enumerate() {
+
+        // Infer in source order. Name resolution has already validated which
+        // references are legal at each point in the program.
+        for (item_index, item) in program.items.iter().enumerate() {
             match item {
-                Item::Binding { name, value } => {
-                    if skip[idx] {
-                        continue;
-                    }
-                    let ty = self.infer(*value);
-                    let declared = self.globals[name.name].ty;
-                    self.expect(&ty, &declared, &value.span);
-                    self.globals.get_mut(name.name).unwrap().defined = true;
-                    bindings.push((name.name, declared));
+                ResolvedItem::Binding {
+                    id,
+                    name,
+                    name_span,
+                    value,
+                } => {
+                    let inferred = self.infer(value);
+                    let declared = self.global_type(*id, name_span);
+                    self.expect(&inferred, &declared, &value.span);
+                    bindings.push((*id, *name, name_span.clone(), declared));
                 }
-                Item::Expr(expr) => {
-                    self.infer(*expr);
+                ResolvedItem::Expr(expr) => {
+                    self.infer(expr);
                 }
-                Item::Print { type_of, expr } => {
-                    let ty = self.infer(*expr);
+                ResolvedItem::Print { type_of, expr } => {
+                    let ty = self.infer(expr);
                     if *type_of {
-                        self.typeof_types.push((idx, ty));
+                        self.typeof_types.push((item_index, ty));
                     } else {
                         self.print_checks.push((ty, expr.span.clone()));
                     }
                 }
-                Item::FnBinding { .. } => unreachable!("desugar removes FnBinding"),
             }
         }
 
-        // Pass 3: checks that need fully resolved types.
+        // Constraints whose validity depends on the final substitutions.
         for (ty, span) in std::mem::take(&mut self.eq_checks) {
             match self.resolve(&ty) {
                 Type::Fn(..) | Type::Unit => {
@@ -193,9 +194,10 @@ impl<'a> TypeChecker<'a> {
                         "cannot compare this type",
                     );
                 }
-                _ => {}
+                Type::Num | Type::Bool | Type::Var(_) => {}
             }
         }
+
         for (ty, span) in std::mem::take(&mut self.print_checks) {
             let resolved = self.resolve(&ty);
             if !matches!(resolved, Type::Num | Type::Bool) {
@@ -208,6 +210,24 @@ impl<'a> TypeChecker<'a> {
             }
         }
 
+        // This is a monomorphic checker: every type variable that remains
+        // unconstrained is an ambiguity. Do not silently turn it into Num.
+        if self.errors.is_empty() {
+            let unresolved_spans: Vec<Span> = self
+                .subst
+                .iter()
+                .enumerate()
+                .filter_map(|(id, value)| value.is_none().then(|| self.var_spans[id].clone()))
+                .collect();
+            for span in unresolved_spans {
+                self.error(
+                    &span,
+                    "cannot infer a concrete type for this expression".to_string(),
+                    "type remains unconstrained",
+                );
+            }
+        }
+
         if !self.errors.is_empty() {
             return Err(self.errors);
         }
@@ -216,19 +236,20 @@ impl<'a> TypeChecker<'a> {
             .into_iter()
             .map(|(idx, ty)| (idx, self.resolve(&ty).pretty()))
             .collect();
+
         let bindings = bindings
             .into_iter()
-            .map(|(name, ty)| (name, self.resolve(&ty)))
+            .map(|(id, name, _span, ty)| CheckedBinding {
+                id,
+                name,
+                ty: self.resolve(&ty),
+            })
             .collect();
 
-        for s in self.subst.iter_mut() {
-            if s.is_none() {
-                *s = Some(Type::Num);
-            }
-        }
-        let node_types = std::mem::take(&mut self.node_types)
+        let raw_node_types = std::mem::take(&mut self.node_types);
+        let node_types = raw_node_types
             .into_iter()
-            .map(|(k, t)| (k, self.resolve(&t)))
+            .map(|(id, ty)| (id, self.resolve(&ty)))
             .collect();
 
         Ok(Checked {
@@ -239,90 +260,94 @@ impl<'a> TypeChecker<'a> {
     }
 
     // ---------- inference ----------
-    //
 
-    fn infer(&mut self, e: &'a Expression<'a>) -> Type<'a> {
-        let ty = self.infer_inner(e);
-        self.node_types
-            .insert(e as *const Expression<'a> as usize, ty);
+    fn infer(&mut self, expr: &crate::resolve::ResolvedExpression<'a>) -> Type<'a> {
+        let ty = self.infer_inner(expr);
+        self.node_types.insert(expr.id, ty);
         ty
     }
 
-    fn infer_inner(&mut self, e: &'a Expression<'a>) -> Type<'a> {
-        match &e.kind {
-            ExprKind::Unit => Type::Unit,
-            ExprKind::Num(_) => Type::Num,
-            ExprKind::Bool(_) => Type::Bool,
-            ExprKind::Ident(name) => self.lookup(*name, &e.span),
-
-            // Neg and Fact both map Num -> Num.
-            ExprKind::Unary { expr, .. } => {
-                let t = self.infer(*expr);
-                self.expect(&t, &Type::Num, &expr.span);
+    fn infer_inner(&mut self, expr: &crate::resolve::ResolvedExpression<'a>) -> Type<'a> {
+        match &expr.kind {
+            ResolvedExprKind::Unit => Type::Unit,
+            ResolvedExprKind::Num(_) => Type::Num,
+            ResolvedExprKind::Bool(_) => Type::Bool,
+            ResolvedExprKind::Ident(name) => match name {
+                ResolvedName::Global(id) => self.global_type(*id, &expr.span),
+                ResolvedName::Local(id) => self.local_type(*id, &expr.span),
+                ResolvedName::Error => self.fresh(&expr.span),
+            },
+            ResolvedExprKind::Unary { op, expr: inner } => {
+                // Both negation and factorial are Num -> Num.
+                match op {
+                    UnaryOp::Neg(_) | UnaryOp::Fact(_) => {}
+                }
+                let actual = self.infer(inner);
+                self.expect(&actual, &Type::Num, &inner.span);
                 Type::Num
             }
-
-            ExprKind::BinaryOp { left, op, right } => match op {
+            ResolvedExprKind::Binary { left, op, right } => match op {
                 BinaryOp::Add(_)
                 | BinaryOp::Sub(_)
                 | BinaryOp::Mul(_)
                 | BinaryOp::Div(_)
                 | BinaryOp::Mod(_)
                 | BinaryOp::Pow(_) => {
-                    self.expect_num(*left);
-                    self.expect_num(*right);
+                    self.expect_num(left);
+                    self.expect_num(right);
                     Type::Num
                 }
                 BinaryOp::Lt(_) | BinaryOp::Gt(_) | BinaryOp::Le(_) | BinaryOp::Ge(_) => {
-                    self.expect_num(*left);
-                    self.expect_num(*right);
+                    self.expect_num(left);
+                    self.expect_num(right);
                     Type::Bool
                 }
                 BinaryOp::Eq(_) | BinaryOp::Ne(_) => {
-                    let l = self.infer(*left);
-                    let r = self.infer(*right);
-                    self.expect(&r, &l, &right.span);
-                    self.eq_checks.push((l, e.span.clone()));
+                    let left_ty = self.infer(left);
+                    let right_ty = self.infer(right);
+                    self.expect(&right_ty, &left_ty, &right.span);
+                    self.eq_checks.push((left_ty, expr.span.clone()));
                     Type::Bool
                 }
             },
-
-            ExprKind::If {
+            ResolvedExprKind::If {
                 cond,
                 then_branch,
                 else_branch,
             } => {
-                let c = self.infer(*cond);
-                self.expect(&c, &Type::Bool, &cond.span);
-                let t = self.infer(*then_branch);
-                let f = self.infer(*else_branch);
-                self.expect(&f, &t, &else_branch.span);
-                t
+                let condition_ty = self.infer(cond);
+                self.expect(&condition_ty, &Type::Bool, &cond.span);
+                let then_ty = self.infer(then_branch);
+                let else_ty = self.infer(else_branch);
+                self.expect(&else_ty, &then_ty, &else_branch.span);
+                then_ty
             }
-
-            ExprKind::Fn { arg, body } => {
-                let param = self.fresh();
-                self.locals.push((arg.name, param));
-                self.fn_depth += 1;
-                let ret = self.infer(*body);
-                self.fn_depth -= 1;
-                self.locals.pop();
-                self.mk_fn(param, ret)
+            ResolvedExprKind::Fn {
+                arg,
+                arg_span,
+                body,
+                ..
+            } => {
+                let param_ty = self.fresh(arg_span);
+                if let Some(slot) = self.locals.get_mut(arg.0) {
+                    *slot = Some(param_ty);
+                }
+                let return_ty = self.infer(body);
+                self.mk_fn(param_ty, return_ty)
             }
-
-            ExprKind::App { func, arg } => {
-                let tf = self.infer(*func);
-                let ta = self.infer(*arg);
-                match self.shallow(&tf) {
+            ResolvedExprKind::App { func, arg } => {
+                let func_ty = self.infer(func);
+                let arg_ty = self.infer(arg);
+                match self.shallow(&func_ty) {
                     Type::Fn(param, ret) => {
-                        self.expect(&ta, param, &arg.span);
+                        self.expect(&arg_ty, param, &arg.span);
                         *ret
                     }
                     Type::Var(_) => {
-                        let ret = self.fresh();
-                        let want = self.mk_fn(ta, ret);
-                        self.expect(&tf, &want, &func.span);
-                        ret
+                        let ret_ty = self.fresh(&expr.span);
+                        let wanted = self.mk_fn(arg_ty, ret_ty);
+                        self.expect(&func_ty, &wanted, &func.span);
+                        ret_ty
                     }
                     other => {
                         let shown = self.resolve(&other).pretty();
@@ -331,46 +356,37 @@ impl<'a> TypeChecker<'a> {
                             format!("cannot apply a value of type `{shown}`"),
                             "this is not a function",
                         );
-                        self.fresh()
+                        self.fresh(&expr.span)
                     }
                 }
             }
         }
     }
 
-    fn expect_num(&mut self, e: &'a Expression<'a>) {
-        let t = self.infer(e);
-        self.expect(&t, &Type::Num, &e.span);
+    fn expect_num(&mut self, expr: &crate::resolve::ResolvedExpression<'a>) {
+        let ty = self.infer(expr);
+        self.expect(&ty, &Type::Num, &expr.span);
     }
 
-    /// Locals first, then top-level names. A top-level name that is declared
-    /// but not yet defined may only be used inside a function body.
-    fn lookup(&mut self, name: &'a str, span: &Span) -> Type<'a> {
-        if let Some((_, ty)) = self.locals.iter().rev().find(|(n, _)| *n == name) {
-            return *ty;
+    fn global_type(&mut self, id: GlobalId, span: &Span) -> Type<'a> {
+        match self.globals.get(id.0).copied() {
+            Some(ty) => ty,
+            None => self.fresh(span),
         }
-        let found = self.globals.get(name).map(|g| (g.ty, g.defined));
-        match found {
-            Some((ty, defined)) if defined || self.fn_depth > 0 => ty,
-            Some(_) => {
-                self.error(
-                    span,
-                    format!("`{name}` is used before its definition"),
-                    "only function bodies may refer to later names",
-                );
-                self.fresh()
-            }
-            None => {
-                self.error(span, format!("unknown name `{name}`"), "not defined");
-                self.fresh()
-            }
+    }
+
+    fn local_type(&mut self, id: LocalId, span: &Span) -> Type<'a> {
+        match self.locals.get(id.0).copied().flatten() {
+            Some(ty) => ty,
+            None => self.fresh(span),
         }
     }
 
     // ---------- unification ----------
 
-    fn fresh(&mut self) -> Type<'a> {
+    fn fresh(&mut self, span: &Span) -> Type<'a> {
         self.subst.push(None);
+        self.var_spans.push(span.clone());
         Type::Var(self.subst.len() - 1)
     }
 
@@ -378,45 +394,45 @@ impl<'a> TypeChecker<'a> {
         Type::Fn(self.arena.alloc(arg), self.arena.alloc(ret))
     }
 
-    /// Follows variable bindings at the top of the type only.
-    fn shallow(&self, t: &Type<'a>) -> Type<'a> {
-        let mut cur = *t;
-        while let Type::Var(v) = cur {
-            match self.subst[v] {
-                Some(next) => cur = next,
+    /// Follows substitutions at the outermost type constructor only.
+    fn shallow(&self, ty: &Type<'a>) -> Type<'a> {
+        let mut current = *ty;
+        while let Type::Var(id) = current {
+            match self.subst[id] {
+                Some(next) => current = next,
                 None => break,
             }
         }
-        cur
+        current
     }
 
-    /// Applies the substitution all the way down.
-    fn resolve(&self, t: &Type<'a>) -> Type<'a> {
-        match self.shallow(t) {
-            Type::Fn(a, b) => self.mk_fn(self.resolve(a), self.resolve(b)),
+    /// Fully applies the current substitution.
+    fn resolve(&self, ty: &Type<'a>) -> Type<'a> {
+        match self.shallow(ty) {
+            Type::Fn(arg, ret) => self.mk_fn(self.resolve(arg), self.resolve(ret)),
             other => other,
         }
     }
 
-    fn occurs(&self, v: usize, t: &Type<'a>) -> bool {
-        match self.shallow(t) {
-            Type::Var(w) => v == w,
-            Type::Fn(a, b) => self.occurs(v, a) || self.occurs(v, b),
-            _ => false,
+    fn occurs(&self, needle: usize, ty: &Type<'a>) -> bool {
+        match self.shallow(ty) {
+            Type::Var(id) => needle == id,
+            Type::Fn(arg, ret) => self.occurs(needle, arg) || self.occurs(needle, ret),
+            Type::Num | Type::Bool | Type::Unit => false,
         }
     }
 
-    fn unify(&mut self, a: &Type<'a>, b: &Type<'a>) -> std::result::Result<(), UnifyError> {
+    fn unify(&mut self, a: &Type<'a>, b: &Type<'a>) -> Result<(), UnifyError> {
         let a = self.shallow(a);
         let b = self.shallow(b);
         match (a, b) {
             (Type::Num, Type::Num) | (Type::Bool, Type::Bool) | (Type::Unit, Type::Unit) => Ok(()),
             (Type::Var(x), Type::Var(y)) if x == y => Ok(()),
-            (Type::Var(x), t) | (t, Type::Var(x)) => {
-                if self.occurs(x, &t) {
+            (Type::Var(x), ty) | (ty, Type::Var(x)) => {
+                if self.occurs(x, &ty) {
                     Err(UnifyError::Infinite)
                 } else {
-                    self.subst[x] = Some(t);
+                    self.subst[x] = Some(ty);
                     Ok(())
                 }
             }
@@ -428,16 +444,16 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
-    /// Unifies `found` with `expected`, reporting at `span` on failure.
+    /// Unifies `found` with `expected`, reporting errors at `span`.
     fn expect(&mut self, found: &Type<'a>, expected: &Type<'a>, span: &Span) {
         match self.unify(found, expected) {
             Ok(()) => {}
             Err(UnifyError::Mismatch) => {
-                let want = self.resolve(expected).pretty();
+                let wanted = self.resolve(expected).pretty();
                 let got = self.resolve(found).pretty();
                 self.error(
                     span,
-                    format!("type mismatch: expected `{want}`, found `{got}`"),
+                    format!("type mismatch: expected `{wanted}`, found `{got}`"),
                     &format!("this has type `{got}`"),
                 );
             }

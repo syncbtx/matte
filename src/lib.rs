@@ -3,5 +3,7 @@ pub mod checker;
 pub mod codegen;
 pub mod desugar;
 pub mod diagnostics;
+pub mod ir;
 pub mod lexer;
 pub mod parser;
+pub mod resolve;

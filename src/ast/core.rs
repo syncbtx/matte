@@ -1,5 +1,4 @@
 use logos::Span;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::lexer::TokenKind;
 
@@ -51,7 +50,7 @@ pub enum ExprKind<'a> {
         op: UnaryOp,
         expr: &'a Expression<'a>,
     },
-    BinaryOp {
+    Binary {
         left: &'a Expression<'a>,
         op: BinaryOp,
         right: &'a Expression<'a>,

@@ -96,6 +96,7 @@ impl<'a, I: Iterator<Item = Token<'a>>> MatteParser<'a, I> {
     error = ParserError<'a>,
     extract = |token: &Token<'a>| token.kind.clone()
 )]
+#[allow(unused)]
 impl<'a, I: Iterator<Item = Token<'a>>> MatteParser<'a, I> {
     // Binding power, low to high:
     //   @@ < ?: < comparison < + - < * / % < prefix - < ^ < application < postfix !
@@ -295,7 +296,7 @@ impl<'a, I: Iterator<Item = Token<'a>>> MatteParser<'a, I> {
         }
 
         Ok(Expression {
-            kind: ExprKind::BinaryOp { left, op, right },
+            kind: ExprKind::Binary { left, op, right },
             span: Span {
                 start: left.span.start,
                 end: right.span.end,
